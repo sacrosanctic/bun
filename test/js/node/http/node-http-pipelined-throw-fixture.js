@@ -130,7 +130,10 @@ const server = http.createServer(serverOptions.get(mode) ?? {}, (req, res) => {
       // No explicit throw: write() rejects its chunk in the call, also on a response that is queued.
       setImmediate(finishFirst);
       events.push(`request ${req.url}`);
-      return void res.write(123);
+      res.write(123);
+      // A write() that keeps the chunk for the turn of the response returns.
+      events.push("write() returned");
+      return;
     case "request":
     case "large":
       setImmediate(finishFirst);

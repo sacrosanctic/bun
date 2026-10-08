@@ -1,7 +1,13 @@
 // JS HTTP/1 server path over an arbitrary Duplex with a JS stand-in for NodeHTTPResponse.
 // Used by http2's `allowHTTP1` ALPN fallback and http's `server.emit("connection", socket)`.
 // See https://github.com/nodejs/node/blob/main/lib/_http_server.js connectionListener.
-const { STATUS_CODES, kPendingCallbacks } = require("internal/http");
+const {
+  STATUS_CODES,
+  kPendingCallbacks,
+  NodeHTTPGrantResult,
+  NodeHTTPResponseFlags,
+  checkResponseChunk,
+} = require("internal/http");
 const { SafeSet } = require("internal/primordials");
 const AsyncContextFrame = require("internal/async_context_frame");
 const { isAnyArrayBuffer, isArrayBufferView, isUint8Array } = require("node:util/types");
@@ -215,16 +221,15 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
     writeToSocket(out);
   }
 
-  // The chunk of a write() or an end() as bytes. It takes what the native handle takes, and throws for the rest with Node's text.
-  function toBuffer(chunk, encoding, fromEnd) {
+  // The chunk of a write() or an end() as bytes. The native check is the rule of the native handle: it throws for a chunk or an encoding that the native handle does not take.
+  function toBuffer(chunk, encoding) {
     if (chunk == null) return null;
-    if (typeof chunk === "string") return Buffer.from(chunk, encoding || "utf8");
+    checkResponseChunk(chunk, encoding, false);
     if (isUint8Array(chunk)) return chunk;
     if (isArrayBufferView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
     if (isAnyArrayBuffer(chunk)) return new Uint8Array(chunk);
-    // Like Node's end(): a falsy chunk is no chunk.
-    if (fromEnd && !chunk) return null;
-    throw $ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "Uint8Array"], chunk);
+    // A string, or a String object.
+    return Buffer.from(typeof chunk === "string" ? chunk : String(chunk), encoding || "utf8");
   }
 
   // Node's write_(): with res.strictContentLength a write must not pass the declared length, and an end must meet it.
@@ -311,9 +316,12 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
   }
 
   const handle = {
-    // NodeHTTPResponseFlags.socket_closed, like the native getter: end() and write() stop at it.
+    // Like the native getter. end() and write() stop at socket_closed; a queued handle is not current.
     get flags() {
-      return this.aborted || socket.destroyed ? 1 : 0;
+      return (
+        (this.aborted || socket.destroyed ? NodeHTTPResponseFlags.socket_closed : 0) |
+        (recorded === null ? NodeHTTPResponseFlags.current : 0)
+      );
     },
     ended: false,
     // True once the bytes end() wrote have left the socket, like the native handle's.
@@ -344,9 +352,6 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
     },
     // Runs once, from flushed(). ServerResponse#end()'s `onwritable` stays unused: its 'finish' comes a tick later, after a closing socket's 'close'.
     onflushed: null as (() => void) | null,
-    cork(callback) {
-      return callback();
-    },
     writeContinue() {
       writeToSocket("HTTP/1.1 100 Continue\r\n\r\n");
     },
@@ -403,11 +408,8 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
       this.writeHead(statusCode, statusMessage, headers, autoHeaderBits, keepAliveTimeoutSecs);
       return this.write(chunk, encoding, callback, strictContentLength);
     },
-    validateWrite(chunk, encoding, fromEnd) {
-      toBuffer(chunk, encoding, fromEnd);
-    },
     write(chunk, encoding, callback, strictContentLength) {
-      const buf = toBuffer(chunk, encoding, false);
+      const buf = toBuffer(chunk, encoding);
       countBody(buf === null ? 0 : buf.byteLength, strictContentLength, false);
       writeHeadToSocket(null);
       const length = writeBody(buf);
@@ -420,7 +422,7 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
     },
     end(chunk, encoding, _callback, strictContentLength, trailerSection?: string) {
       if (this.ended) return 0;
-      const buf = toBuffer(chunk, encoding, true);
+      const buf = toBuffer(chunk, encoding);
       const length = buf === null ? 0 : buf.byteLength;
       countBody(length, strictContentLength, true);
       // A finished response emits no 'drain': native disarms its drain callback in end() too.
@@ -443,20 +445,28 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
       }
       return settleEnd(this, length, terminated);
     },
-    // The response has the socket now: what the handle recorded goes out. Negative while a part of it is still in the socket, like write() and end().
+    // The response has the socket now: what the handle recorded goes out under one cork, like Node's _flushOutput().
     flushQueued() {
       const writes = recorded;
-      if (writes === null) return 0;
+      if (writes === null) return NodeHTTPGrantResult.flushed;
       recorded = null;
-      for (let i = 0; i < writes.length; i += 2) {
-        writeToSocket(writes[i], writes[i + 1]);
+      socket.cork();
+      try {
+        for (let i = 0; i < writes.length; i += 2) {
+          writeToSocket(writes[i], writes[i + 1]);
+        }
+      } finally {
+        socket.uncork();
       }
       const end = recordedEnd;
+      let buffered;
       if (end !== null) {
         recordedEnd = null;
-        return settleEnd(this, end[0], end[1]) < 0 ? -1 : 1;
+        buffered = settleEnd(this, end[0], end[1]) < 0;
+      } else {
+        buffered = socket.writableNeedDrain;
       }
-      return socket.writableNeedDrain ? -1 : 1;
+      return buffered ? NodeHTTPGrantResult.buffered : NodeHTTPGrantResult.flushed;
     },
     endWithTrailers,
     writeHeadAndEndWithTrailers,
@@ -484,7 +494,7 @@ function connectionListenerHTTP1(server, socket, options) {
   const { kHandle: kHttp1ResponseHandle, http1ServerPipeline } = require("internal/http");
   // Populated by node:_http_server, which the require("node:http") above loads.
   const {
-    queuePipelinedResponse,
+    constructFallbackResponse,
     advanceResponsePipeline,
     abortQueuedPipelinedResponses,
     lastPipelinedResponse,
@@ -602,19 +612,21 @@ function connectionListenerHTTP1(server, socket, options) {
       if (!socket._paused && socket.readable) socket.resume();
     };
 
-    const res = new ServerResponseClass(req);
-    // The native dispatcher seeds these from the server; renderNativeHeaders
-    // reads them to decide the Keep-Alive auto-header bits, so the fallback
-    // path must carry them too or keep-alive responses lose their timeout line.
-    res._keepAliveTimeout = keepAliveTimeout;
-    const { maxRequestsPerSocket } = server;
-    res._maxRequestsPerSocket = maxRequestsPerSocket;
     // Node's parserOnIncoming outgoing queue: pipelined requests parse while
     // the previous response is still assigned (its 'finish' detach is a tick
     // away), so queue this response instead of letting assignSocket throw
     // ERR_HTTP_SOCKET_ASSIGNED.
     const queued = !!socket._httpMessage;
     const handle = createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTimeout, queued);
+    // Like the native dispatcher: the response has its handle, and its place
+    // in the queue, from its construction on.
+    const res = constructFallbackResponse(ServerResponseClass, req, handle, socket, queued);
+    // The native dispatcher seeds these from the server; renderNativeHeaders
+    // reads them to decide the Keep-Alive auto-header bits, so the fallback
+    // path must carry them too or keep-alive responses lose their timeout line.
+    res._keepAliveTimeout = keepAliveTimeout;
+    const { maxRequestsPerSocket } = server;
+    res._maxRequestsPerSocket = maxRequestsPerSocket;
     handle.onfinished = function () {
       socket[kHttp1ActiveRequests] = Math.max(0, (socket[kHttp1ActiveRequests] || 1) - 1);
       if (!shouldKeepAlive && !socket.destroyed) {
@@ -624,17 +636,12 @@ function connectionListenerHTTP1(server, socket, options) {
     handle.onflushed = function () {
       finishDrainedResponse(res);
     };
-    res[kHttp1ResponseHandle] = handle;
-    if (queued) {
-      queuePipelinedResponse(socket, res, versionMajor < 1 || versionMinor < 1);
-    } else {
-      res.assignSocket(socket);
-    }
+    if (!queued) res.assignSocket(socket);
     // node's resOnFinish: release the socket once the response completes,
     // then either end the connection (a response that advertised Connection:
     // close must not be followed by another one - the close path aborts the
     // queued responses) or hand the socket to the next queued pipelined
-    // response, replaying whatever it buffered.
+    // response, whose handle then writes what it recorded.
     res.on("finish", function onFallbackResponseFinish() {
       const finishedReq = this.req;
       if (!finishedReq._consuming && !finishedReq._readableState.resumeScheduled) finishedReq._dump();

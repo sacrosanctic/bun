@@ -109,9 +109,9 @@ public:
     /* Make a previously queued pipelined response the connection's current
      * response: reset the per-response uWS state (the part the request handler
      * normally resets per parsed request), resume socket reads when the queue
-     * drained, and write what the response recorded while it waited. Returns 0
-     * when the connection is already gone, a negative number while a part of
-     * the recorded output is still buffered, and a positive number otherwise. */
+     * drained, and write what the response recorded while it waited. Returns
+     * the GrantResult of NodeHTTPResponse.rs: 0 when the connection is already
+     * gone, -1 when the socket has to drain first, and 1 otherwise. */
     int32_t startPipelinedResponse(JSC::VM& vm, WebCore::JSNodeHTTPResponse* response, bool isAncient, bool connectionClose);
     /* The response that answers on this connection now. A close reaches it and the queued ones. */
     WebCore::JSNodeHTTPResponse* currentResponse() const { return m_currentResponse.get(); }

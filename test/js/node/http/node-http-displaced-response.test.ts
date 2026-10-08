@@ -89,7 +89,6 @@ describe.concurrent.each(["tcp", "tls"])("a response that lost the connection to
           returned("abort"),
           returned("writeContinue"),
           returned("bufferedAmount"),
-          threw("cork", "ERR_STREAM_ALREADY_FINISHED"),
         ],
         stderr: "",
         exitCode: 0,
@@ -167,7 +166,6 @@ describe.concurrent.each(["tcp", "tls"])("a response that lost the connection to
         "flushHeaders": "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb\r\nsecond-body\r\n0\r\n\r\n",
         "writeContinue": "HTTP/1.1 100 Continue\r\n\r\n" + head(11) + "second-body",
         "writeInformational": "early" + head(11) + "second-body",
-        "cork": head(11) + "second-body",
       };
       expect(await run("queued", transport)).toEqual({
         results: Object.entries(outputs).map(([call, output]) => ({
