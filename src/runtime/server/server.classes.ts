@@ -150,10 +150,6 @@ export default [
         fn: "flushHeaders",
         length: 0,
       },
-      cork: {
-        fn: "cork",
-        length: 1,
-      },
       ref: {
         fn: "jsRef",
       },
@@ -196,10 +192,6 @@ export default [
       writeHeadAndWrite: {
         fn: "writeHeadAndWrite",
         length: 9,
-      },
-      validateWrite: {
-        fn: "validateWrite",
-        length: 3,
       },
       resume: {
         fn: "doResume",

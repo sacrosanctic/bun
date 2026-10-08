@@ -125,11 +125,19 @@ pub(crate) struct NodeHTTPResponse {
 }
 
 /// What a response was given while it waited for the connection (pipelining). Each call was
-/// converted and checked when it ran, so `grant_connection` only writes and cannot throw.
+/// converted and checked when it ran, so `grant_connection` only writes.
+///
+/// The record holds no pointer into the JS heap. A string chunk keeps its own bytes. A header
+/// array or a buffer chunk stays a JS value: an element of the array in the wrapper's
+/// `pendingWriteBuffer` slot, which the GC visits and which a response that waits for the
+/// connection does not use otherwise. The flush reads a buffer chunk like a write to the current
+/// response does, so a buffer that JS detached since the call is empty then.
 #[derive(Default)]
 struct QueuedOutput {
     /// In call order.
     items: Vec<QueuedItem>,
+    /// How many JS values the record has. An item names its value by index.
+    values: u32,
     /// A head, a `flushHeaders()` or a body chunk is recorded: the status line is decided.
     started: bool,
     ended: bool,
@@ -142,63 +150,37 @@ enum QueuedItem {
     Head(QueuedHead),
     /// `flushHeaders()`: the header block ends here, ahead of the raw bytes and the body that follow.
     FlushHeaders,
-    Chunk(crate::node::StringOrBuffer<'static>),
+    Chunk(QueuedChunk),
     /// The last chunk and the framed trailer section of the end() call.
-    End(crate::node::StringOrBuffer<'static>, Box<[u8]>),
+    End(QueuedChunk, Box<[u8]>),
+}
+
+enum QueuedChunk {
+    /// A string chunk, or no chunk.
+    Bytes(crate::node::StringOrBuffer<'static>),
+    /// A buffer chunk: the index of its JS value.
+    Value(u32),
 }
 
 struct QueuedHead {
     /// The status line after "HTTP/1.1 ".
     status: Box<[u8]>,
-    /// An array of strings that only this head holds, or what `writeHead` got when that is no array.
-    headers: StrongOptional,
+    /// The index of the JS value of the header array, if the head has one.
+    headers: Option<u32>,
     auto_header_bits: u32,
     keep_alive_timeout_secs: u32,
 }
 
-impl QueuedOutput {
-    /// The conversion of a write() borrows a JS buffer for the call. The record keeps it pinned and rooted.
-    fn retain(
-        global_object: &JSGlobalObject,
-        chunk: crate::node::StringOrBuffer<'static>,
-        input_value: JSValue,
-    ) -> JsResult<crate::node::StringOrBuffer<'static>> {
-        use crate::node::StringOrBuffer;
-        if !matches!(chunk, StringOrBuffer::Buffer(_)) {
-            return Ok(chunk);
-        }
-        let mut retained =
-            StringOrBuffer::buffer_from_js(global_object, input_value, crate::node::Flavor::Async)?;
-        if let StringOrBuffer::PinnedBuffer(buffer) = &mut retained {
-            // A typed array that has no ArrayBuffer of its own takes no pin: JS that reads its
-            // `buffer` can transfer the storage away, which frees it. Only a copy survives that.
-            if !buffer.pinned {
-                let bytes = buffer.slice();
-                let mut copy = Vec::new();
-                if copy.try_reserve_exact(bytes.len()).is_err() {
-                    return Err(global_object.throw_out_of_memory());
-                }
-                copy.extend_from_slice(bytes);
-                global_object.vm().report_extra_memory(copy.len());
-                return Ok(StringOrBuffer::owned(copy));
-            }
-            if !buffer.copy_if_resizable(global_object) {
-                return Err(global_object.throw_out_of_memory());
-            }
-        }
-        Ok(retained)
-    }
+// A response that never waits for the connection pays one pointer for the record.
+const _: () = assert!(size_of::<JsCell<Option<Box<QueuedOutput>>>>() == size_of::<usize>());
 
-    /// The heap of the VM is gone with the buffers: `Drop` must not unpin them.
-    fn defuse(&mut self) {
-        for item in &mut self.items {
-            if let QueuedItem::Chunk(chunk) | QueuedItem::End(chunk, _) = item
-                && let crate::node::StringOrBuffer::PinnedBuffer(buffer) = chunk
-            {
-                buffer.defuse();
-            }
-        }
-    }
+/// Where the record of a queued response stands: a call that throws takes it back there.
+#[derive(Clone, Copy)]
+struct QueuedMark {
+    items: usize,
+    values: u32,
+    started: bool,
+    ended: bool,
 }
 
 bitflags! {
@@ -401,7 +383,7 @@ fn bun_vm_mut(_global: &JSGlobalObject) -> &mut VirtualMachine {
 /// body, kept non-generic and out of line.
 ///
 /// Every caller is an error branch that is essentially never taken on the
-/// node:http response hot path (`write_head` / `write_or_end` / `cork`). Marking
+/// node:http response hot path (`write_head` / `write_or_end`). Marking
 /// this `#[cold]` + `#[inline(never)]` keeps the `ErrorBuilder::throw` codegen —
 /// message formatting (`core::fmt`), error-code table lookup, JS error object
 /// allocation — physically separated from those hot functions so it neither
@@ -447,6 +429,35 @@ fn err_throw_chunk_type(global: &JSGlobalObject, chunk: JSValue) -> jsc::JsError
         b"string or an instance of Buffer or Uint8Array",
         chunk,
     )
+}
+
+/// An encoding that is not one. Like Node's write_(), the type of the chunk is judged before its
+/// encoding: a chunk that is neither a string nor a buffer gets the error of the chunk.
+#[cold]
+#[inline(never)]
+fn err_throw_unknown_encoding(
+    global: &JSGlobalObject,
+    chunk: JSValue,
+    encoding: JSValue,
+) -> jsc::JsError {
+    use crate::node::{Encoding, StringObjects, StringOrBuffer};
+    if !StringOrBuffer::converts_with_encoding(chunk, Encoding::Utf8, StringObjects::Allow) {
+        return err_throw_chunk_type(global, chunk);
+    }
+    let name = if encoding.is_string() {
+        encoding.to_bun_string(global)
+    } else {
+        JSGlobalObject::inspect_for_error_message(global, encoding)
+    };
+    match name {
+        Ok(name) => global
+            .err(
+                ErrorCode::UNKNOWN_ENCODING,
+                format_args!("Unknown encoding: {}", name),
+            )
+            .throw(),
+        Err(err) => err,
+    }
 }
 
 /// AnyResponse `is_ssl()` shim (upstream lacks this accessor).
@@ -557,6 +568,22 @@ impl PendingPinnedWrite {
 /// Writes larger than this take the pinned zero-copy path; below it the cork
 /// buffer (`LoopData::CORK_COPY_MAX` = 16KB) already handles the copy.
 const PINNED_WRITE_THRESHOLD: usize = 16 * 1024;
+
+/// What `grant_connection` tells the server socket. `NodeHTTPGrantResult` in
+/// `src/js/internal/http.ts` has the same values.
+#[repr(i32)]
+#[derive(Clone, Copy)]
+enum GrantResult {
+    /// The connection is gone.
+    Gone = 0,
+    /// Nothing of what the response recorded waits for the socket.
+    Flushed = 1,
+    /// The socket has to drain first, like after an `end()` or a `write()` that returns a
+    /// negative number. A response that ended has not completed: its drain callback runs when the
+    /// last byte is out. One that did not end has bytes in the buffer of the socket: its drain
+    /// callback runs when that buffer is empty.
+    Buffered = -1,
+}
 
 /// What `send` does with the length of a chunk.
 #[derive(Clone, Copy)]
@@ -1067,7 +1094,8 @@ impl NodeHTTPResponse {
         if flags.contains(Flags::REQUEST_HAS_COMPLETED) || flags.contains(Flags::SOCKET_CLOSED) {
             return JSValue::js_number_from_int32(0);
         }
-        if let Some(raw_response) = self.reader() {
+        // Only the current response has bytes in the socket. For a queued one they are of a response ahead.
+        if let Some(raw_response) = self.writer() {
             let amount = raw_response
                 .get_buffered_amount()
                 .saturating_add(self.pending_pinned_write.get().remaining.len() as u64);
@@ -1132,6 +1160,7 @@ impl NodeHTTPResponse {
             arguments,
             auto_header_bits,
             keep_alive_timeout_secs,
+            callframe.this(),
         )
     }
 
@@ -1145,6 +1174,7 @@ impl NodeHTTPResponse {
         arguments: &[JSValue],
         auto_header_bits: u32,
         keep_alive_timeout_secs: u32,
+        this_value: JSValue,
     ) -> JsResult<JSValue> {
         // Arguments are converted first: ToString on statusMessage can run JS that ends or destroys the response.
         let status_code_value: JSValue = arguments.first().copied().unwrap_or(JSValue::UNDEFINED);
@@ -1156,6 +1186,16 @@ impl NodeHTTPResponse {
             Some(v) if v != JSValue::NULL => v,
             _ => JSValue::UNDEFINED,
         };
+        // The flat [name, value, ...] array that node:http renders, or none. The native head writer
+        // runs no JS for that form, so a caller can hold the bytes of a chunk by reference while
+        // the head goes out, and a recorded head can go out at the grant.
+        if headers_object_value.is_cell() && !headers_object_value.is_array() {
+            return Err(global_object.throw_invalid_argument_type_value(
+                b"headers",
+                b"array",
+                headers_object_value,
+            ));
+        }
 
         let status_code: i32 = if !status_code_value.is_undefined() {
             global_object.validate_integer_range::<i32>(
@@ -1199,6 +1239,7 @@ impl NodeHTTPResponse {
                 headers_object_value,
                 auto_header_bits,
                 keep_alive_timeout_secs,
+                this_value,
             );
         };
         if flags.contains(Flags::UPGRADED) || self.is_socket_closed_or_closing() {
@@ -1278,6 +1319,66 @@ impl NodeHTTPResponse {
         Ok(())
     }
 
+    /// Adds a JS value to the record of a queued response and returns its index.
+    fn push_queued_value(
+        &self,
+        global_object: &JSGlobalObject,
+        this_value: JSValue,
+        value: JSValue,
+    ) -> JsResult<u32> {
+        debug_assert!(!this_value.is_empty());
+        let values = match js::pending_write_buffer_get_cached(this_value) {
+            Some(values) if values.is_array() => values,
+            _ => {
+                let values = JSValue::create_empty_array(global_object, 0)?;
+                js::pending_write_buffer_set_cached(this_value, global_object, values);
+                values
+            }
+        };
+        let index = self
+            .queued_output
+            .get()
+            .as_ref()
+            .map_or(0, |queued| queued.values);
+        values.put_index(global_object, index, value)?;
+        self.queued_output
+            .with_mut(|slot| slot.get_or_insert_with(Default::default).values = index + 1);
+        Ok(index)
+    }
+
+    fn queued_mark(&self) -> Option<QueuedMark> {
+        self.queued_output.get().as_ref().map(|queued| QueuedMark {
+            items: queued.items.len(),
+            values: queued.values,
+            started: queued.started,
+            ended: queued.ended,
+        })
+    }
+
+    /// Takes the record back to `mark`: what a call recorded before it threw is not sent.
+    #[cold]
+    fn restore_queued_output(
+        &self,
+        global_object: &JSGlobalObject,
+        this_value: JSValue,
+        mark: Option<QueuedMark>,
+    ) {
+        self.queued_output
+            .with_mut(|slot| match (mark, slot.as_mut()) {
+                (Some(mark), Some(queued)) => {
+                    queued.items.truncate(mark.items);
+                    queued.values = mark.values;
+                    queued.started = mark.started;
+                    queued.ended = mark.ended;
+                }
+                _ => *slot = None,
+            });
+        // A value past the mark is not of the record: the next one takes its index.
+        if mark.is_none_or(|mark| mark.values == 0) {
+            js::pending_write_buffer_set_cached(this_value, global_object, JSValue::ZERO);
+        }
+    }
+
     /// `writeHead` without the connection. A queued response records the head; one that lost the connection drops it.
     #[cold]
     #[inline(never)]
@@ -1289,6 +1390,7 @@ impl NodeHTTPResponse {
         headers: JSValue,
         auto_header_bits: u32,
         keep_alive_timeout_secs: u32,
+        this_value: JSValue,
     ) -> JsResult<JSValue> {
         if !self.is_queued() {
             // We haven't emitted the "close" event yet.
@@ -1297,19 +1399,12 @@ impl NodeHTTPResponse {
         self.check_head_not_recorded(global_object)?;
         validate_status_message(global_object, status_message)?;
 
-        // This can run JS.
-        let headers = resolve_header_pairs(global_object, headers)?;
-        if !self.is_queued() {
-            return Ok(JSValue::UNDEFINED);
-        }
-        self.check_head_not_recorded(global_object)?;
-
         let head = QueuedHead {
             status: with_status_text(status_code, status_message, |status| Box::from(status)),
             headers: if headers.is_cell() {
-                StrongOptional::create(headers, global_object)
+                Some(self.push_queued_value(global_object, this_value, headers)?)
             } else {
-                StrongOptional::empty()
+                None
             },
             auto_header_bits,
             keep_alive_timeout_secs,
@@ -1324,36 +1419,20 @@ impl NodeHTTPResponse {
 
     /// `handle.writeHeadAndEnd(status, statusMessage, headersArray, chunk,
     /// encoding, strictContentLength)` — the writeHead + end pair under one
-    /// native cork and one JS->native crossing, replacing
-    /// `handle.cork(() => { handle.writeHead(...); handle.end(...) })` (three
-    /// crossings and a per-request closure) on the node:http response path.
+    /// native cork and one JS->native crossing on the node:http response path.
     pub(crate) fn write_head_and_end(
         &self,
         global_object: &JSGlobalObject,
         callframe: &CallFrame,
     ) -> JsResult<JSValue> {
         let arguments = callframe.arguments();
-        let auto_header_bits = arguments
-            .get(6)
-            .copied()
-            .filter(|v| v.is_number())
-            .map_or(0, |v| v.to_int32() as u32);
-        let keep_alive_timeout_secs = arguments
-            .get(7)
-            .copied()
-            .filter(|v| v.is_number())
-            .map_or(0, |v| v.to_u32());
-        // prepare_write::<true> reads (chunk, encoding, _, strictContentLength).
-        let end_args = [
-            arguments.get(3).copied().unwrap_or(JSValue::UNDEFINED),
-            arguments.get(4).copied().unwrap_or(JSValue::UNDEFINED),
-            JSValue::UNDEFINED,
-            arguments.get(5).copied().unwrap_or(JSValue::UNDEFINED),
-        ];
+        let arg = |index: usize| arguments.get(index).copied().unwrap_or(JSValue::UNDEFINED);
+        let (auto_header_bits, keep_alive_timeout_secs) = auto_header_args(arg(6), arg(7));
         self.write_head_and_body::<true, false>(
             global_object,
             &arguments[..arguments.len().min(3)],
-            &end_args,
+            // prepare_write reads (chunk, encoding, _, strictContentLength).
+            &[arg(3), arg(4), JSValue::UNDEFINED, arg(5)],
             JSValue::UNDEFINED,
             auto_header_bits,
             keep_alive_timeout_secs,
@@ -1368,28 +1447,14 @@ impl NodeHTTPResponse {
         callframe: &CallFrame,
     ) -> JsResult<JSValue> {
         let arguments = callframe.arguments();
-        let auto_header_bits = arguments
-            .get(6)
-            .copied()
-            .filter(|v| v.is_number())
-            .map_or(0, |v| v.to_int32() as u32);
-        let keep_alive_timeout_secs = arguments
-            .get(7)
-            .copied()
-            .filter(|v| v.is_number())
-            .map_or(0, |v| v.to_u32());
-        // prepare_write::<true> reads (chunk, encoding, _, strictContentLength).
-        let end_args = [
-            arguments.get(3).copied().unwrap_or(JSValue::UNDEFINED),
-            arguments.get(4).copied().unwrap_or(JSValue::UNDEFINED),
-            JSValue::UNDEFINED,
-            arguments.get(5).copied().unwrap_or(JSValue::UNDEFINED),
-        ];
+        let arg = |index: usize| arguments.get(index).copied().unwrap_or(JSValue::UNDEFINED);
+        let (auto_header_bits, keep_alive_timeout_secs) = auto_header_args(arg(6), arg(7));
         self.write_head_and_body::<true, true>(
             global_object,
             &arguments[..arguments.len().min(3)],
-            &end_args,
-            arguments.get(8).copied().unwrap_or(JSValue::UNDEFINED),
+            // prepare_write reads (chunk, encoding, _, strictContentLength).
+            &[arg(3), arg(4), JSValue::UNDEFINED, arg(5)],
+            arg(8),
             auto_header_bits,
             keep_alive_timeout_secs,
             callframe.this(),
@@ -1398,35 +1463,20 @@ impl NodeHTTPResponse {
 
     /// `handle.writeHeadAndWrite(status, statusMessage, headersArray, chunk,
     /// encoding, callback, strictContentLength)` — `writeHeadAndEnd` for the
-    /// first `res.write()`. It replaces
-    /// `handle.cork(() => { handle.writeHead(...); handle.write(...) })`.
+    /// first `res.write()`.
     pub(crate) fn write_head_and_write(
         &self,
         global_object: &JSGlobalObject,
         callframe: &CallFrame,
     ) -> JsResult<JSValue> {
         let arguments = callframe.arguments();
-        let auto_header_bits = arguments
-            .get(7)
-            .copied()
-            .filter(|v| v.is_number())
-            .map_or(0, |v| v.to_int32() as u32);
-        let keep_alive_timeout_secs = arguments
-            .get(8)
-            .copied()
-            .filter(|v| v.is_number())
-            .map_or(0, |v| v.to_u32());
-        // prepare_write::<false> reads (chunk, encoding, callback, strictContentLength).
-        let write_args = [
-            arguments.get(3).copied().unwrap_or(JSValue::UNDEFINED),
-            arguments.get(4).copied().unwrap_or(JSValue::UNDEFINED),
-            arguments.get(5).copied().unwrap_or(JSValue::UNDEFINED),
-            arguments.get(6).copied().unwrap_or(JSValue::UNDEFINED),
-        ];
+        let arg = |index: usize| arguments.get(index).copied().unwrap_or(JSValue::UNDEFINED);
+        let (auto_header_bits, keep_alive_timeout_secs) = auto_header_args(arg(7), arg(8));
         self.write_head_and_body::<false, false>(
             global_object,
             &arguments[..arguments.len().min(3)],
-            &write_args,
+            // prepare_write reads (chunk, encoding, callback, strictContentLength).
+            &[arg(3), arg(4), arg(5), arg(6)],
             JSValue::UNDEFINED,
             auto_header_bits,
             keep_alive_timeout_secs,
@@ -1448,8 +1498,7 @@ impl NodeHTTPResponse {
         keep_alive_timeout_secs: u32,
         this_value: JSValue,
     ) -> JsResult<JSValue> {
-        // Same gate as cork(): the old flow threw ERR_STREAM_ALREADY_FINISHED
-        // from cork() before either phase ran.
+        // Neither phase runs for a response that has completed, lost its socket or was upgraded.
         let flags = self.flags.get();
         if flags.contains(Flags::REQUEST_HAS_COMPLETED)
             || flags.contains(Flags::SOCKET_CLOSED)
@@ -1485,7 +1534,7 @@ impl NodeHTTPResponse {
             TrailerSection::None
         };
         let mut string_or_buffer = crate::node::StringOrBuffer::EMPTY;
-        let args = Self::prepare_write::<IS_END>(global_object, body_args, &mut string_or_buffer)?;
+        let args = Self::prepare_write(global_object, body_args, &mut string_or_buffer)?;
         if let Some(content_length) = args.strict_content_length {
             self.check_content_length::<IS_END>(
                 global_object,
@@ -1494,9 +1543,8 @@ impl NodeHTTPResponse {
             )?;
         }
 
-        // BACKREF: same keep-alive pattern as cork() — either phase can reach
-        // JS (string coercions, drain callbacks), which could drop the last
-        // reference to this response mid-call.
+        // BACKREF: the end of the response can close the socket, which runs JS
+        // that could drop the last reference to this response mid-call.
         let this = bun_ptr::BackRef::from(ptr::NonNull::from(self));
         let _guard = self.ref_guard();
 
@@ -1509,6 +1557,7 @@ impl NodeHTTPResponse {
                     head_args,
                     auto_header_bits,
                     keep_alive_timeout_secs,
+                    this_value,
                 )?;
                 if IS_END {
                     this.resume_socket_for_end();
@@ -1524,17 +1573,39 @@ impl NodeHTTPResponse {
             if let Some(raw_response) = raw_response {
                 raw_response.corked(|| {
                     // Capture `this` so a `self`-derived pointer reaches the
-                    // FFI closure-data slot (see cork()'s R-2 note).
+                    // FFI closure-data slot.
                     let _escape = this;
                     result = run();
                 });
             } else {
+                // A queued response records. A call that throws takes back what it recorded.
+                let mark = this.queued_mark();
                 result = run();
+                if result.is_err() {
+                    this.restore_queued_output(global_object, this_value, mark);
+                }
             }
         }
 
         result
     }
+}
+
+/// The auto-header bits and the keep-alive timeout that the C++ head writer renders (kAutoHeader* in NodeHTTP.cpp).
+#[inline(always)]
+fn auto_header_args(bits: JSValue, keep_alive_timeout_secs: JSValue) -> (u32, u32) {
+    (
+        if bits.is_number() {
+            bits.to_int32() as u32
+        } else {
+            0
+        },
+        if keep_alive_timeout_secs.is_number() {
+            keep_alive_timeout_secs.to_u32()
+        } else {
+            0
+        },
+    )
 }
 
 /// Defense-in-depth against HTTP response splitting. Matches Node.js checkInvalidHeaderChar:
@@ -1591,27 +1662,6 @@ fn with_status_text<R>(status_code: i32, status_message: &[u8], f: impl FnOnce(&
         heap.extend_from_slice(message);
         f(&heap)
     }
-}
-
-/// The headers of a recorded head. node:http passes a flat [name, value, ...] scratch array that the
-/// next response reuses, so the record gets its own array, with every element converted to a string:
-/// `NodeHTTPServer__writeHead` then runs no JS when the head goes out.
-fn resolve_header_pairs(global_object: &JSGlobalObject, headers: JSValue) -> JsResult<JSValue> {
-    if !headers.is_array() {
-        return Ok(headers);
-    }
-    let length = u32::try_from(headers.get_length(global_object)?).unwrap_or(u32::MAX);
-    let resolved = JSValue::create_empty_array(global_object, length as usize)?;
-    for i in 0..length {
-        let value = headers.get_index(global_object, i)?;
-        let value = if value.is_string_literal() {
-            value
-        } else {
-            value.to_js_string(global_object)?.to_js()
-        };
-        resolved.put_index(global_object, i, value)?;
-    }
-    Ok(resolved)
 }
 
 fn write_head_internal(
@@ -1782,7 +1832,7 @@ impl NodeHTTPResponse {
 
         if EVENT == AbortEvent::Abort {
             self.mark_socket_closed();
-            self.discard_queued_output();
+            self.discard_queued_output(js_value);
         }
 
         let _guard = self.ref_guard();
@@ -1882,35 +1932,70 @@ impl NodeHTTPResponse {
 
     /// The server socket makes this queued response the connection's current response, and what the
     /// response recorded while it waited goes out. `js_this` is this response's wrapper.
-    /// Returns 0 if the connection is gone, and a negative number while a part of that output is
-    /// still buffered.
     #[uws::uws_callback(export = "Bun__NodeHTTPResponse_grantConnection", no_catch)]
     pub(crate) fn grant_connection(&self, js_this: JSValue) -> i32 {
         if self.reader().is_none() {
-            return 0;
+            return GrantResult::Gone as i32;
         }
         self.update_flags(|f| f.insert(Flags::CURRENT));
         match self.queued_output.replace(None) {
-            Some(queued) => self.flush_queued_output(*queued, js_this),
-            None => 1,
+            Some(queued) => self.flush_queued_output(*queued, js_this) as i32,
+            None => GrantResult::Flushed as i32,
         }
+    }
+
+    /// The bytes of a recorded buffer chunk as they are now: a buffer that JS detached since the
+    /// call has none. This runs no JS.
+    fn read_buffer_chunk(
+        global_object: &JSGlobalObject,
+        value: JSValue,
+    ) -> crate::node::StringOrBuffer<'static> {
+        use crate::node::StringOrBuffer;
+        if value.is_cell()
+            && value.js_type().is_array_buffer_like()
+            && let Ok(chunk) =
+                StringOrBuffer::buffer_from_js(global_object, value, crate::node::Flavor::Sync)
+        {
+            return chunk;
+        }
+        StringOrBuffer::EMPTY
     }
 
     #[cold]
     #[inline(never)]
-    fn flush_queued_output(&self, queued: QueuedOutput, js_this: JSValue) -> i32 {
+    fn flush_queued_output(&self, queued: QueuedOutput, js_this: JSValue) -> GrantResult {
         scoped_log!(
             NodeHTTPResponse,
             "flushQueuedOutput({} items)",
             queued.items.len()
         );
-        let Some(raw_response) = self.writer() else {
-            return 0;
-        };
         let global_object = self.server.global_this();
+        // The JS values of the record leave the slot: the tail of a large write uses it from here on.
+        let values =
+            js::pending_write_buffer_get_cached(js_this).filter(|values| values.is_array());
+        if values.is_some() {
+            js::pending_write_buffer_set_cached(js_this, global_object, JSValue::ZERO);
+        }
+        let Some(raw_response) = self.writer() else {
+            return GrantResult::Gone;
+        };
         // A write can end in the close of the socket, which runs JS.
         let this = bun_ptr::BackRef::from(ptr::NonNull::from(self));
         let _guard = self.ref_guard();
+        // The array is this record's own: a read of one of its elements runs no JS.
+        let value_at = |index: u32| -> JSValue {
+            values
+                .and_then(|values| values.get_direct_index(global_object, index).ok())
+                .unwrap_or(JSValue::UNDEFINED)
+        };
+        // The bytes of a chunk, and the JS value that they are of, if any.
+        let resolve = |chunk: QueuedChunk| match chunk {
+            QueuedChunk::Bytes(bytes) => (bytes, JSValue::UNDEFINED),
+            QueuedChunk::Value(index) => {
+                let value = value_at(index);
+                (Self::read_buffer_chunk(global_object, value), value)
+            }
+        };
 
         raw_response.corked(|| {
             for item in queued.items {
@@ -1929,12 +2014,13 @@ impl NodeHTTPResponse {
                     QueuedItem::Informational(bytes) => raw_response.write_informational(&bytes),
                     QueuedItem::FlushHeaders => raw_response.flush_headers(false),
                     QueuedItem::Head(head) => {
-                        // Every value was converted when the head was recorded, so this runs no JS.
+                        // The head writer runs no JS for an array. Only a string that cannot be
+                        // resolved for lack of memory makes it throw.
                         if let Err(err) = write_head_internal(
                             &raw_response,
                             global_object,
                             &head.status,
-                            head.headers.get().unwrap_or(JSValue::UNDEFINED),
+                            head.headers.map_or(JSValue::UNDEFINED, value_at),
                             head.auto_header_bits,
                             head.keep_alive_timeout_secs,
                         ) {
@@ -1946,27 +2032,29 @@ impl NodeHTTPResponse {
                             );
                         }
                     }
-                    QueuedItem::Chunk(mut chunk) => {
-                        let _ = this.send::<false, false>(
+                    QueuedItem::Chunk(chunk) => {
+                        let (mut bytes, value) = resolve(chunk);
+                        let _ = this.send_outlined::<false>(
                             global_object,
                             raw_response,
                             raw_response.state(),
-                            &mut chunk,
+                            &mut bytes,
                             &[],
-                            JSValue::UNDEFINED,
+                            value,
                             JSValue::UNDEFINED,
                             js_this,
                             ChunkCount::Counted,
                         );
                     }
-                    QueuedItem::End(mut chunk, trailers) => {
-                        let _ = this.send::<true, true>(
+                    QueuedItem::End(chunk, trailers) => {
+                        let (mut bytes, value) = resolve(chunk);
+                        let _ = this.send_outlined::<true>(
                             global_object,
                             raw_response,
                             raw_response.state(),
-                            &mut chunk,
+                            &mut bytes,
                             &trailers,
-                            JSValue::UNDEFINED,
+                            value,
                             JSValue::UNDEFINED,
                             js_this,
                             ChunkCount::Counted,
@@ -1975,6 +2063,9 @@ impl NodeHTTPResponse {
                 }
             }
         });
+        if let Some(values) = values {
+            values.ensure_still_alive();
+        }
 
         let flags = self.flags.get();
         let buffered = if flags.contains(Flags::ENDED) {
@@ -1982,12 +2073,19 @@ impl NodeHTTPResponse {
         } else {
             self.has_unflushed_write()
         };
-        if buffered { -1 } else { 1 }
+        if buffered {
+            GrantResult::Buffered
+        } else {
+            GrantResult::Flushed
+        }
     }
 
     /// The connection is gone for a response that waited for it: what it recorded is never sent.
-    fn discard_queued_output(&self) {
-        drop(self.queued_output.replace(None));
+    /// `js_this` is this response's wrapper, if the caller has it.
+    fn discard_queued_output(&self, js_this: JSValue) {
+        if self.queued_output.replace(None).is_some() && !js_this.is_empty() {
+            js::pending_write_buffer_set_cached(js_this, self.server.global_this(), JSValue::ZERO);
+        }
     }
 
     /// `js_this` is this response's wrapper. `adopted`: a WebSocket has the socket, so nothing of it is touched.
@@ -2015,7 +2113,7 @@ impl NodeHTTPResponse {
 
         let _guard = self.ref_guard();
         let global_object = self.server.global_this();
-        self.discard_queued_output();
+        self.discard_queued_output(js_this);
         let pinned = self.pending_pinned_write.get();
         if pinned.is_some() {
             // The bytes that a write() already counted go out before the next response.
@@ -2204,7 +2302,7 @@ impl NodeHTTPResponse {
     pub(crate) fn abort(
         &self,
         global_object: &JSGlobalObject,
-        _frame: &CallFrame,
+        frame: &CallFrame,
     ) -> JsResult<JSValue> {
         if self.is_done() {
             return Ok(JSValue::UNDEFINED);
@@ -2224,7 +2322,7 @@ impl NodeHTTPResponse {
         // still reachable via the socket (get_this_value() returns ZERO once
         // SOCKET_CLOSED is set).
         self.clear_pending_pinned_write(global_object, JSValue::ZERO);
-        self.discard_queued_output();
+        self.discard_queued_output(frame.this());
         self.release_body_slot();
         self.mark_socket_closed();
         if let Some(raw_response) = self.writer() {
@@ -2489,11 +2587,59 @@ impl NodeHTTPResponse {
         js::on_writable_set_cached(js_this, global_object, JSValue::UNDEFINED);
     }
 
+    /// The encoding of the chunk of a write()/end(). Like Writable.prototype.write, a falsy value
+    /// means the default, and any other value has to name an encoding.
+    #[inline(always)]
+    fn chunk_encoding(
+        global_object: &JSGlobalObject,
+        chunk: JSValue,
+        encoding_value: JSValue,
+    ) -> JsResult<crate::node::Encoding> {
+        if encoding_value.is_falsey() {
+            return Ok(crate::node::Encoding::Utf8);
+        }
+        if encoding_value.is_string()
+            && let Some(encoding) = crate::node::Encoding::from_js(encoding_value, global_object)?
+        {
+            return Ok(encoding);
+        }
+        Err(err_throw_unknown_encoding(
+            global_object,
+            chunk,
+            encoding_value,
+        ))
+    }
+
+    /// The checks that write() and end() make of a chunk, with no conversion: no bytes, no JS.
+    /// `type_only` leaves the encoding out, for a caller that has to judge the chunk before the
+    /// point where Node judges the encoding.
+    #[cold]
+    pub(crate) fn check_chunk(
+        global_object: &JSGlobalObject,
+        chunk: JSValue,
+        encoding_value: JSValue,
+        type_only: bool,
+    ) -> JsResult<()> {
+        use crate::node::{Encoding, StringObjects, StringOrBuffer};
+        if chunk.is_undefined_or_null() {
+            return Ok(());
+        }
+        let encoding = if type_only {
+            Encoding::Utf8
+        } else {
+            Self::chunk_encoding(global_object, chunk, encoding_value)?
+        };
+        if !StringOrBuffer::converts_with_encoding(chunk, encoding, StringObjects::Allow) {
+            return Err(err_throw_chunk_type(global_object, chunk));
+        }
+        Ok(())
+    }
+
     /// Converts the arguments of a write()/end(): (chunk, encoding, callback, strictContentLength).
     /// The chunk goes into the caller's slot. This reads and writes nothing of the response, so a call
     /// that it rejects has committed nothing.
     #[inline(always)]
-    fn prepare_write<const IS_END: bool>(
+    fn prepare_write(
         global_object: &JSGlobalObject,
         arguments: &[JSValue],
         string_or_buffer: &mut crate::node::StringOrBuffer<'static>,
@@ -2535,52 +2681,29 @@ impl NodeHTTPResponse {
             break 'brk None;
         };
 
-        // Like Node's end(): a falsy chunk is no chunk. An empty string converts to no bytes either
-        // way, so 0n is the one cell that needs the test.
-        let has_chunk = !input_value.is_undefined_or_null()
-            && (!IS_END
-                || (input_value.is_cell() && input_value.js_type() != jsc::JSType::HeapBigInt)
-                || input_value.to_boolean());
         // Construct in place — returning
         // `JsResult<Option<StringOrBuffer>>` by value here lowered to ~128B of
         // `vmovups` stack copies per `res.end()`; the `_into` out-param form
         // writes straight into the caller's slot.
-        if has_chunk {
-            let mut encoding = crate::node::Encoding::Utf8;
-            // Like Writable.prototype.write: a falsy encoding means the default.
-            if !encoding_value.is_falsey() {
-                let known = if encoding_value.is_string() {
-                    crate::node::Encoding::from_js(encoding_value, global_object)?
-                } else {
-                    None
-                };
-                encoding = match known {
-                    Some(e) => e,
-                    None => {
-                        let name = if encoding_value.is_string() {
-                            encoding_value.to_bun_string(global_object)?
-                        } else {
-                            JSGlobalObject::inspect_for_error_message(
-                                global_object,
-                                encoding_value,
-                            )?
-                        };
-                        return Err(global_object
-                            .err(
-                                ErrorCode::UNKNOWN_ENCODING,
-                                format_args!("Unknown encoding: {}", name),
-                            )
-                            .throw());
-                    }
-                };
-            }
+        if !input_value.is_undefined_or_null() {
+            let encoding = Self::chunk_encoding(global_object, input_value, encoding_value)?;
 
-            if !crate::node::StringOrBuffer::from_js_with_encoding_into(
+            let converted = crate::node::StringOrBuffer::from_js_with_encoding_into(
                 string_or_buffer,
                 global_object,
                 input_value,
                 encoding,
-            )? {
+            )?;
+            // `check_chunk` judges a chunk without this conversion: the two must agree.
+            debug_assert_eq!(
+                converted,
+                crate::node::StringOrBuffer::converts_with_encoding(
+                    input_value,
+                    encoding,
+                    crate::node::StringObjects::Allow,
+                )
+            );
+            if !converted {
                 return Err(err_throw_chunk_type(global_object, input_value));
             }
         }
@@ -2651,7 +2774,7 @@ impl NodeHTTPResponse {
             TrailerSection::None
         };
         let mut string_or_buffer = crate::node::StringOrBuffer::EMPTY;
-        let args = Self::prepare_write::<IS_END>(global_object, arguments, &mut string_or_buffer)?;
+        let args = Self::prepare_write(global_object, arguments, &mut string_or_buffer)?;
         self.deliver::<IS_END, WITH_TRAILERS>(
             global_object,
             &args,
@@ -2687,6 +2810,7 @@ impl NodeHTTPResponse {
                 args,
                 string_or_buffer,
                 trailer_section,
+                this_value,
             );
         };
         // Like Node's _writeRaw on a destroyed socket: 'close' has not been emitted yet, so the write is dropped.
@@ -2707,16 +2831,57 @@ impl NodeHTTPResponse {
             );
         }
 
-        self.send::<IS_END, WITH_TRAILERS>(
+        if WITH_TRAILERS {
+            return self.send_outlined::<IS_END>(
+                global_object,
+                raw_response,
+                state,
+                string_or_buffer,
+                trailer_section,
+                args.input_value,
+                args.callback_value,
+                this_value,
+                ChunkCount::Count(args.strict_content_length),
+            );
+        }
+        self.send::<IS_END, false>(
+            global_object,
+            raw_response,
+            state,
+            string_or_buffer,
+            &[],
+            args.input_value,
+            args.callback_value,
+            this_value,
+            ChunkCount::Count(args.strict_content_length),
+        )
+    }
+
+    /// `send` as a call, for the paths that are not hot: an end with trailers and the flush of a
+    /// record share one copy for each kind of call.
+    #[inline(never)]
+    fn send_outlined<const IS_END: bool>(
+        &self,
+        global_object: &JSGlobalObject,
+        raw_response: uws::AnyResponse,
+        state: uws::State,
+        string_or_buffer: &mut crate::node::StringOrBuffer<'static>,
+        trailer_section: &[u8],
+        input_value: JSValue,
+        callback_value: JSValue,
+        this_value: JSValue,
+        count: ChunkCount,
+    ) -> JsResult<JSValue> {
+        self.send::<IS_END, true>(
             global_object,
             raw_response,
             state,
             string_or_buffer,
             trailer_section,
-            args.input_value,
-            args.callback_value,
+            input_value,
+            callback_value,
             this_value,
-            ChunkCount::Count(args.strict_content_length),
+            count,
         )
     }
 
@@ -2731,6 +2896,7 @@ impl NodeHTTPResponse {
         args: &WriteArgs,
         string_or_buffer: &mut crate::node::StringOrBuffer<'static>,
         trailer_section: &[u8],
+        this_value: JSValue,
     ) -> JsResult<JSValue> {
         if !self.is_queued() {
             return Ok(if is_end {
@@ -2747,24 +2913,30 @@ impl NodeHTTPResponse {
             );
         }
 
-        let chunk = QueuedOutput::retain(
-            global_object,
-            core::mem::take(string_or_buffer),
-            args.input_value,
-        )?;
-        let chunk_length = chunk.slice().len();
+        let chunk_length = string_or_buffer.slice().len();
         if is_end {
             self.count_chunk::<true>(global_object, chunk_length, args.strict_content_length)?;
         } else {
             self.count_chunk::<false>(global_object, chunk_length, args.strict_content_length)?;
         }
+        let chunk = if matches!(string_or_buffer, crate::node::StringOrBuffer::Buffer(_)) {
+            // The bytes of a buffer are only borrowed for this call: the record keeps the JS value.
+            QueuedChunk::Value(self.push_queued_value(
+                global_object,
+                this_value,
+                args.input_value,
+            )?)
+        } else {
+            QueuedChunk::Bytes(core::mem::take(string_or_buffer))
+        };
+        let item = if is_end {
+            QueuedItem::End(chunk, Box::from(trailer_section))
+        } else {
+            QueuedItem::Chunk(chunk)
+        };
         self.queued_output.with_mut(|slot| {
             let queued = slot.get_or_insert_with(Default::default);
-            queued.items.push(if is_end {
-                QueuedItem::End(chunk, Box::from(trailer_section))
-            } else {
-                QueuedItem::Chunk(chunk)
-            });
+            queued.items.push(item);
             queued.started = true;
             queued.ended = is_end;
         });
@@ -3098,32 +3270,7 @@ impl NodeHTTPResponse {
         callframe: &CallFrame,
     ) -> JsResult<JSValue> {
         let arguments = callframe.arguments();
-        self.write_or_end::<false, false>(global_object, arguments, JSValue::ZERO)
-    }
-
-    /// `handle.validateWrite(chunk, encoding, isEnd)`: the checks of the chunk and the encoding of a
-    /// `write()` or an `end()`, with nothing written. For a caller that has to run code between the
-    /// checks and the write.
-    #[cold]
-    pub(crate) fn validate_write(
-        &self,
-        global_object: &JSGlobalObject,
-        callframe: &CallFrame,
-    ) -> JsResult<JSValue> {
-        let arguments = callframe.arguments();
-        let write_args = [
-            arguments.first().copied().unwrap_or(JSValue::UNDEFINED),
-            arguments.get(1).copied().unwrap_or(JSValue::UNDEFINED),
-            JSValue::UNDEFINED,
-            JSValue::UNDEFINED,
-        ];
-        let mut string_or_buffer = crate::node::StringOrBuffer::EMPTY;
-        if arguments.get(2).is_some_and(|is_end| is_end.to_boolean()) {
-            Self::prepare_write::<true>(global_object, &write_args, &mut string_or_buffer)?;
-        } else {
-            Self::prepare_write::<false>(global_object, &write_args, &mut string_or_buffer)?;
-        }
-        Ok(JSValue::UNDEFINED)
+        self.write_or_end::<false, false>(global_object, arguments, callframe.this())
     }
 
     fn on_auto_flush(&self) -> bool {
@@ -3282,77 +3429,12 @@ impl NodeHTTPResponse {
         raw.timeout(seconds);
     }
 
-    pub(crate) fn cork(
-        &self,
-        global_object: &JSGlobalObject,
-        callframe: &CallFrame,
-    ) -> JsResult<JSValue> {
-        // Perf: borrow the `arguments()` slice (ptr+len) instead of
-        // materialising `Arguments<1>` by value — `cork` runs on every
-        // `res.end()`, so the small-aggregate copy + bounds branch are pure
-        // per-request overhead with no upstream equivalent.
-        let Some(&corked_fn) = callframe.arguments().first() else {
-            return Err(global_object.throw_not_enough_arguments("cork", 1, 0));
-        };
-
-        if !corked_fn.is_callable() {
-            return Err(global_object.throw_invalid_argument_type_value(
-                b"cork",
-                b"function",
-                corked_fn,
-            ));
-        }
-
-        let flags = self.flags.get();
-        if flags.contains(Flags::REQUEST_HAS_COMPLETED)
-            || flags.contains(Flags::SOCKET_CLOSED)
-            || flags.contains(Flags::UPGRADED)
-        {
-            return err_throw(
-                global_object,
-                ErrorCode::ERR_STREAM_ALREADY_FINISHED,
-                "Stream is already ended",
-            );
-        }
-
-        let mut result: JsResult<JSValue> = Ok(JSValue::UNDEFINED);
-
-        // R-2: this method takes `&self`, so the `noalias` miscompile
-        // (b818e70e1c57) is structurally impossible — `&T` is `readonly`, not
-        // `noalias`, so re-entrant writes through other `&self` views are
-        // sound. No `black_box` launder is needed; it was a hard optimization
-        // barrier on the node:http hot path (`cork` runs on every `res.end()`)
-        // that forced `self` to memory and blocked inlining/regalloc of the
-        // cork prologue.
-        let this = bun_ptr::BackRef::from(ptr::NonNull::from(self));
-        // Keeps the live `m_ctx` heap payload alive across re-entry.
-        let _guard = self.ref_guard();
-
-        // Snapshot before re-entry; the handle is `Copy`.
-        let raw_response = this.writer();
-        if let Some(raw_response) = raw_response {
-            raw_response.corked(|| {
-                // Capture `this` so a `self`-derived pointer reaches the FFI
-                // closure-data slot (see the R-2 note above).
-                let _escape = this;
-                result = corked_fn.call(global_object, JSValue::UNDEFINED, &[]);
-            });
-        } else {
-            result = corked_fn.call(global_object, JSValue::UNDEFINED, &[]);
-        }
-
-        result
-    }
-
     pub(crate) fn finalize(&self) {
         // The JS wrapper is being collected; drop the raw backref so a late
         // body delivery cannot read through a dead cell.
         self.armed_this_value.set(JSValue::ZERO);
-        // The server socket roots the wrapper of a response that waits for the connection, so this
-        // one only dies with the VM.
-        if let Some(mut queued) = self.queued_output.replace(None) {
-            queued.defuse();
-        }
+        // The record holds no cell of the heap: its JS values are in a slot of the wrapper.
+        drop(self.queued_output.replace(None));
     }
 
     #[inline]
