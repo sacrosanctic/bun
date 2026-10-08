@@ -139,11 +139,6 @@ function isBinaryFrame(data, opts) {
   return byType && !propertyIsEnumerable.$call(opts, "binary");
 }
 
-// npm ws: toBuffer(data || EMPTY_BUFFER), https://github.com/websockets/ws/blob/8.18.3/lib/buffer-util.js#L87-L105
-function toFramePayload(data) {
-  return data ? Buffer.from(data) : Buffer.alloc(0);
-}
-
 function payloadByteLength(data) {
   return typeof data === "string" ? Buffer.byteLength(data) : (data?.byteLength ?? data?.size ?? 0);
 }
@@ -515,19 +510,15 @@ class BunWebSocket extends EventEmitter {
     }
 
     if (typeof data === "number") data = data.toString();
-    this.#frame(data, isBinaryFrame(data, opts), cb);
-  }
-
-  #frame(data, binary, cb) {
-    let framed;
     try {
-      framed = sendClientFrame(this.#ws, data, binary);
+      const ws = this.#ws;
+      // Any other value goes out as the text of String(data), as with the public send().
+      if (sendClientFrame(ws, data, isBinaryFrame(data, opts)) === undefined) sendClientFrame(ws, `${data}`, false);
     } catch (error) {
       // Node.js APIs expect callback arguments to be called after the current stack pops
       if (typeof cb === "function") process.nextTick(cb, error);
       return;
     }
-    if (framed === undefined) return this.#frame(toFramePayload(data), binary, cb);
     // deviation: this should be called once the data is written, not immediately
     // Node.js APIs expect callback arguments to be called after the current stack pops
     if (typeof cb === "function") process.nextTick(cb, null);
@@ -1173,11 +1164,14 @@ class BunWebSocketMocked extends EventEmitter {
     const state = this.#state;
     if (state !== ReadyState_OPEN && state !== ReadyState_CONNECTING) return;
 
-    // uws can flush its buffer without a drain event, so a send behind a queue gets no socket: it only checks `data`.
+    // Behind a queue the entry gets no socket and only checks `data` and `compress`: uws can flush with no drain event.
     const ws = this.#enquedMessages.length !== 0 ? null : this.#ws;
     const taken = sendServerFrame(ws, data, binary, compress);
-    // Buffer.from() can run code of the caller that closes the socket, so the state is read again.
-    if (taken === undefined) return this.#frame(toFramePayload(data), binary, compress, cb);
+    if (taken === undefined) {
+      if (data == null) throw new Error("send requires a non-empty message");
+      // As the public send(): the text of String(data). That can close the socket, so the state is read again.
+      return this.#frame(`${data}`, false, compress, cb);
+    }
     if (taken) {
       if (typeof cb === "function") process.nextTick(cb);
       return;

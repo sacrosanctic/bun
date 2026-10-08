@@ -245,6 +245,10 @@ pub(crate) fn js_send_frame(
     };
 
     let status = if data.is_string_literal() {
+        // With no socket the string is not encoded: `ws.js` keeps it and sends it later.
+        if this.is_none() {
+            return Ok(JSValue::FALSE);
+        }
         let view = data.to_js_string_view(global_this)?;
         let utf8 = view.to_utf8();
         send(utf8.slice())
